@@ -39,7 +39,7 @@ def model_info_from_dict(loaded_dict):
 class MyBot(Bot):
 
     def initialize(self):
-        self.deterministic = False #NOTE: Set to True if you want to use deterministic actions, default is False
+        self.deterministic = True #NOTE: Set to True if you want to use deterministic actions, default is False
         self.ticks = self.tick_skip = 8 #NOTE: Set the amount of ticks to skip, default is 8
         self.device = torch.device("cpu") #NOTE: Set the device to use, default is cpu
 
@@ -55,12 +55,15 @@ class MyBot(Bot):
         #! update this with your action and obs
         action_parser = LookupTableAction()
         Obs = DefaultObs(
-                             pos_coef=np.asarray([1 / common_values.SIDE_WALL_X, 1 / common_values.BACK_NET_Y, 1 / common_values.CEILING_Z]),
-                             ang_coef=1 / np.pi,
-                             lin_vel_coef=1 / common_values.CAR_MAX_SPEED,
-                             ang_vel_coef=1 / common_values.CAR_MAX_ANG_VEL,
-                             boost_coef=1 / 100.0)
-        
+            zero_padding=3,
+            pos_coef=np.asarray([1 / common_values.SIDE_WALL_X, 
+                                 1 / common_values.BACK_NET_Y, 
+                                 1 / common_values.CEILING_Z]),
+            ang_coef=1 / np.pi,
+            lin_vel_coef=1 / common_values.CAR_MAX_SPEED,
+            ang_vel_coef=1 / common_values.CAR_MAX_ANG_VEL,
+            boost_coef=1 / 100.0
+        )
 
         # Some variables that are going to be used
         self.game_state = GameState()
@@ -176,4 +179,4 @@ if __name__ == "__main__":
     # Connect to RLBot and run
     # Having the agent id here allows for easier development,
     # as otherwise the RLBOT_AGENT_ID environment variable must be set.
-    MyBot("rlgym_and_rlbot_comunity/rlgymv2exaplebot/v0.1").run()
+    MyBot("Matt/MattBot/v0").run()

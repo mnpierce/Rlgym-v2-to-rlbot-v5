@@ -1,7 +1,7 @@
 #:schema https://rlbot.org/schemas/agent.json
 [settings]
 # The name that will be displayed in game
-name = "RLGym v2 Bot"
+name = "MattBot"
 # Path to loadout config from runner
 loadout_file = "loadout.toml"
 # (OPTIONAL) - what you want the working directory set to
@@ -11,13 +11,13 @@ loadout_file = "loadout.toml"
 root_dir = ""
 # The command RLBot will call to start your bot on Windows
 # ex: "bot.exe" for compiled bots, or "python bot.py" if you don't want to freeze your python bot
-run_command = "python bot.py"
+run_command = "C:/Users/mnpie/OneDrive/Documents/GitHub/RocketLeagueBot/.venv/Scripts/python.exe bot.py"
 # The command RLBot will call to start your bot on linux
 # If this isn't set, RLBot may attempt to run the Windows command under Wine
-run_command_linux = "python bot.py"
+run_command_linux = "C:/Users/mnpie/OneDrive/Documents/GitHub/RocketLeagueBot/.venv/Scripts/python.exe bot.py"
 # This must be a unqiue identifier for your bot
 # recommended format is "author/botname/version"
-agent_id = "rlgym_and_rlbot_comunity/rlgymv2exaplebot/v0.1"
+agent_id = "Matt/MattBot/v0"
 
 # These values are optional but useful metadata for helper programs
 [details]
@@ -30,7 +30,7 @@ fun_fact = ""
 # Link to github repository
 source_link = "https://github.com/Martico2432/Rlgym-v2-to-rlbot-v5"
 # Name of the bot's creator/developer
-developer = "TheCommunity"
+developer = "Matt Pierce"
 # Programming language
 language = "Python/RLGym"
 # ALL POSSIBLE TAGS: 1v1, teamplay, goalie, hoops, dropshot, snow-day, spike-rush, heatseaker, memebot
