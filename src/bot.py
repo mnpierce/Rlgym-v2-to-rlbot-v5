@@ -1,11 +1,20 @@
 import os
 import numpy as np
 import torch
+import sys
+import glob
+
+# Add root directory to path so we can import rewards.py
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
+
 from rlbot.flat import BallAnchor, ControllerState, GamePacket, MatchPhase
 from rlbot.managers import Bot
 from rlgym_compat import GameState, common_values
 from collections import OrderedDict
 
+# Import Custom Rewards
+from rewards import FaceBallReward, InAirReward, JumpTouchReward, SpeedTowardBallReward, TouchReward, VelocityBallToGoalReward, AdvancedTouchReward, KickoffReward, FirstTouchKickoffReward
+from rlgym.rocket_league.reward_functions import CombinedReward
 
 # Your imports here
 from act import LookupTableAction
@@ -14,8 +23,67 @@ from discrete import DiscreteFF
 
 from rlgym_compat.sim_extra_info import SimExtraInfo
 
+# --- Helper Class for Breakdown ---
+class TrackingCombinedReward(CombinedReward):
+    """
+    A wrapper around CombinedReward that stores the most recent reward breakdown
+    so we can visualize it in the overlay.
+    """
+    def __init__(self, *rewards_and_weights):
+        super().__init__(*rewards_and_weights)
+        self.last_breakdown = {} # {agent_id: {reward_name: value}}
+        self.last_non_zero_values = {} # {agent_id: {reward_name: value}}
+        
+        # Explicitly store them to avoid AttributeError if parent doesn't expose them publicly
+        # CombinedReward usually takes arguments like (Reward(), 1.0), (Reward2(), 0.5)...
+        self.stored_rewards = [r for r, w in rewards_and_weights]
+        self.stored_weights = [w for r, w in rewards_and_weights]
 
-model_path = 'PPO_POLICY.pt'
+    def get_rewards(self, agents, state, is_terminated, is_truncated, shared_info):
+        combined_rewards = {agent: 0.0 for agent in agents}
+        self.last_breakdown = {agent: {} for agent in agents}
+        
+        # Init history dict for new agents
+        for agent in agents:
+            if agent not in self.last_non_zero_values:
+                self.last_non_zero_values[agent] = {}
+
+        # Use our stored list instead of self.rewards
+        for reward_fn, weight in zip(self.stored_rewards, self.stored_weights):
+            vals = reward_fn.get_rewards(agents, state, is_terminated, is_truncated, shared_info)
+            for agent in agents:
+                val = vals[agent]
+                weighted_val = val * weight
+                combined_rewards[agent] += weighted_val
+                
+                name = type(reward_fn).__name__
+                if name in self.last_breakdown[agent]:
+                    name = f"{name}_2"
+                
+                # Store current value
+                self.last_breakdown[agent][name] = weighted_val
+                
+                # Update history if non-zero
+                if abs(weighted_val) > 0.001:
+                    self.last_non_zero_values[agent][name] = weighted_val
+                # If zero, ensure it exists in history as 0.0 if not present
+                elif name not in self.last_non_zero_values[agent]:
+                    self.last_non_zero_values[agent][name] = 0.0
+                    
+        return combined_rewards
+
+# Find latest checkpoint
+def find_latest_checkpoint(base_dir="../../data/checkpoints"):
+    # Look specifically for PPO_POLICY.pt files
+    checkpoints = glob.glob(os.path.join(base_dir, "**", "PPO_POLICY.pt"), recursive=True)
+    if not checkpoints:
+        return 'PPO_POLICY.pt' # Fallback to local file
+    
+    # Sort by modification time (newest first)
+    checkpoints.sort(key=os.path.getmtime, reverse=True)
+    return checkpoints[0]
+
+model_path = find_latest_checkpoint()
 
 
 def model_info_from_dict(loaded_dict):
@@ -42,9 +110,18 @@ class MyBot(Bot):
         self.deterministic = True #NOTE: Set to True if you want to use deterministic actions, default is False
         self.ticks = self.tick_skip = 8 #NOTE: Set the amount of ticks to skip, default is 8
         self.device = torch.device("cpu") #NOTE: Set the device to use, default is cpu
+        
+        print(f"Loading model from: {model_path}")
 
-        # Get the bot data from model, so no need to modfify anything here
-        model_file = torch.load(model_path, map_location=self.device)
+        # Get the bot data from model
+        # Handle both full learner states and raw policy states
+        loaded_file = torch.load(model_path, map_location=self.device)
+        if isinstance(loaded_file, dict) and "policy_state_dict" in loaded_file:
+            print("Detected full Learner state, extracting policy...")
+            model_file = loaded_file["policy_state_dict"]
+        else:
+            model_file = loaded_file
+
         input_amount, action_amount, layer_sizes = model_info_from_dict(model_file)
 
         # Make the policy
@@ -64,6 +141,18 @@ class MyBot(Bot):
             ang_vel_coef=1 / common_values.CAR_MAX_ANG_VEL,
             boost_coef=1 / 100.0
         )
+        
+        # Setup Reward Function (Match train.py but use Tracking)
+        self.reward_fn = TrackingCombinedReward(
+            (SpeedTowardBallReward(), 5),
+            (JumpTouchReward(), 200),
+            (FaceBallReward(), 0.5),
+            (VelocityBallToGoalReward(), 20),
+            # (GoalReward(), 1500), # Goals handled by state reset usually
+            (AdvancedTouchReward(touch_reward=0.05, acceleration_reward=1, min_ball_speed=300), 75),
+            (KickoffReward(), 10),
+            (FirstTouchKickoffReward(), 500)
+        )
 
         # Some variables that are going to be used
         self.game_state = GameState()
@@ -77,6 +166,9 @@ class MyBot(Bot):
         
         self.extra_info = SimExtraInfo(self.field_info, tick_skip=self.tick_skip)
         self.game_state = self.game_state.create_compat_game_state(self.field_info)
+        
+        # Enable Rendering Explicitly
+        self.update_rendering_status(True)
 
     def get_output(self, packet: GamePacket) -> ControllerState:
         """
@@ -104,6 +196,73 @@ class MyBot(Bot):
         
         extra_info = self.extra_info.get_extra_info(packet)
         self.game_state.update(packet, extra_info=extra_info)
+        
+        # --- REWARD CALCULATION & RENDERING ---
+        # We calculate this every frame (or tick) to update the visual feedback live
+        
+        # Reset reward on kickoff/new round
+        if packet.match_info.match_phase == MatchPhase.Kickoff and packet.match_info.frame_num % 10 == 0:
+             self.reward_fn.reset([self.player_id], self.game_state, {})
+
+        rewards = self.reward_fn.get_rewards([self.player_id], self.game_state, {self.player_id: False}, {self.player_id: False}, {})
+        current_reward = rewards[self.player_id]
+        
+        # Render (Throttled to 30fps / every 4 frames)
+        # Only render for the first bot (Index 0) to avoid overlapping text in self-play
+        if packet.match_info.frame_num % 4 == 0 and self.index == 0:
+            try:
+                with self.renderer.context():
+                    # Signature: red, green, blue, alpha
+                    # Palette
+                    white = self.renderer.create_color(255, 255, 255, 255)
+                    lime = self.renderer.create_color(50, 255, 50, 255)    
+                    red = self.renderer.create_color(255, 80, 80, 255)     
+                    silver = self.renderer.create_color(220, 220, 220, 255) 
+                    
+                    # Draw Header
+                    # Move down to avoid RLBot status overlay (y=0.25)
+                    box_x, box_y = 0.02, 0.25
+                    header_y = box_y + 0.01
+                    self.renderer.draw_string_2d(f"Bot Reward: {current_reward:.2f}", box_x + 0.01, header_y, 1.5, white)
+                    
+                    # Prepare Data
+                    if self.reward_fn.last_breakdown:
+                        current_values = self.reward_fn.last_breakdown.get(self.player_id)
+                        if not current_values:
+                             current_values = self.reward_fn.last_breakdown.get(str(self.player_id), {})
+                        
+                        history_values = self.reward_fn.last_non_zero_values.get(self.player_id)
+                        if not history_values:
+                             history_values = self.reward_fn.last_non_zero_values.get(str(self.player_id), {})
+        
+                        all_keys = list(current_values.keys())
+
+                        y = header_y + 0.04
+                        line_height = 0.025
+                        
+                        for k in all_keys:
+                            val = current_values.get(k, 0.0)
+                            last_val = history_values.get(k, 0.0)
+                            
+                            is_active = abs(val) > 0.001
+                            
+                            if is_active:
+                                color = lime if val > 0 else red
+                                prefix = ">>" 
+                                display_val = val
+                            else:
+                                color = silver
+                                prefix = "  "
+                                display_val = last_val
+                                
+                            display_name = k.replace("Reward", "")
+                            
+                            self.renderer.draw_string_2d(f"{prefix} {display_name}: {display_val:.2f}", box_x + 0.01, y, 1, color)
+                            y += line_height
+
+            except Exception as e:
+                print(f"Render Error: {e}")
+        # --------------------------------------
         
         if self.ticks >= self.tick_skip - 1:
             self.ticks = 0
