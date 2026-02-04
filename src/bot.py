@@ -3,6 +3,7 @@ import numpy as np
 import torch
 import sys
 import glob
+import math
 
 # Add root directory to path so we can import rewards.py
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
@@ -73,14 +74,13 @@ class TrackingCombinedReward(CombinedReward):
         return combined_rewards
 
 # Find latest checkpoint
-def find_latest_checkpoint(base_dir="../../data/checkpoints"):
-    # Look specifically for PPO_POLICY.pt files
-    checkpoints = glob.glob(os.path.join(base_dir, "**", "PPO_POLICY.pt"), recursive=True)
-    if not checkpoints:
-        return 'PPO_POLICY.pt' # Fallback to local file
+def find_latest_checkpoint():
+    # Use the directory where this script (bot.py) is located
+    script_dir = os.path.dirname(os.path.abspath(__file__))
     
-    # Sort by modification time (newest first)
-    checkpoints.sort(key=os.path.getmtime, reverse=True)
+    # 1. Look in the same folder as this script
+    checkpoints = glob.glob(os.path.join(script_dir, "**", "PPO_POLICY.*t"), recursive=True)
+    
     return checkpoints[0]
 
 model_path = find_latest_checkpoint()
@@ -104,6 +104,97 @@ def model_info_from_dict(loaded_dict):
     return inputs, outputs, layer_sizes
 
 
+# --- C++ Compatible Observation Builder ---
+class CppDefaultObs(DefaultObs):
+    def __init__(self, pos_coef=1/2300, ang_coef=1/math.pi, lin_vel_coef=1/2300, ang_vel_coef=1/math.pi, boost_coef=1/100.0):
+        super().__init__()
+        self.pos_coef = pos_coef
+        self.ang_coef = ang_coef
+        self.lin_vel_coef = lin_vel_coef
+        self.ang_vel_coef = ang_vel_coef
+        self.boost_coef = boost_coef
+
+    def build_obs(self, agents: list, state: GameState, shared_info: dict) -> dict:
+        obs = {}
+        for agent in agents:
+            # We need the previous action. In this script, it is passed via shared_info or handled externally
+            # For now, we assume shared_info['prev_actions'][agent] exists, or we default to zeros
+            prev_action = shared_info.get('prev_actions', {}).get(agent, np.zeros(8))
+            obs[agent] = self._build_obs(agent, state, prev_action)
+        return obs
+
+    def _build_obs(self, agent, state: GameState, prev_action: np.ndarray) -> np.ndarray:
+        car = state.cars[agent]
+        if car.team_num == common_values.ORANGE_TEAM:
+            inverted = True
+            ball = state.inverted_ball
+            pads = state.inverted_boost_pad_timers
+        else:
+            inverted = False
+            ball = state.ball
+            pads = state.boost_pad_timers
+
+        # 1. Ball (9)
+        ball_obs = np.concatenate([
+            ball.position * self.pos_coef,
+            ball.linear_velocity * self.lin_vel_coef,
+            ball.angular_velocity * self.ang_vel_coef
+        ])
+
+        # 2. Previous Action (8)
+        prev_action_obs = prev_action
+
+        # 3. Pads (34)
+        # C++ DefaultOBS does not normalize pad timers, so we use raw values
+        pads_obs = pads
+        
+        # 4. Self (19)
+        car_obs = self._get_player_obs(car, inverted)
+
+        # 5. Others (Teammates + Opponents) (19 each)
+        # C++ DefaultOBS iterates all other players. 
+        # In 1v1, it's just the one opponent.
+        others_obs = []
+        
+        # Sort cars to ensure consistent order (e.g. by ID) if multiple
+        other_cars = [c for id, c in state.cars.items() if id != agent]
+        # In 1v1 C++ code, it just iterates. We should probably sort by ID to be safe or rely on insertion order.
+        # For strict 1v1, there is only one.
+        
+        for other in other_cars:
+             others_obs.append(self._get_player_obs(other, inverted))
+
+        # Combine
+        return np.concatenate([
+            ball_obs,
+            prev_action_obs,
+            pads_obs,
+            car_obs,
+            np.concatenate(others_obs) if others_obs else np.array([])
+        ])
+
+    def _get_player_obs(self, car, inverted):
+        if inverted:
+            phys = car.inverted_physics
+        else:
+            phys = car.physics
+
+        return np.concatenate([
+            phys.position * self.pos_coef,
+            phys.forward, # Rotation matrix forward
+            phys.up,      # Rotation matrix up
+            phys.linear_velocity * self.lin_vel_coef,
+            phys.angular_velocity * self.ang_vel_coef,
+            [
+                car.boost_amount * self.boost_coef,
+                1.0 if car.on_ground else 0.0,
+                # hasFlip in C++: typically (!doubleJumped && !flipped && (onGround || !airTimeExceeded))
+                # RLGym GameState usually tracks has_flip
+                1.0 if car.has_flip else 0.0,
+                1.0 if car.is_demoed else 0.0
+            ]
+        ])
+
 class MyBot(Bot):
 
     def initialize(self):
@@ -122,25 +213,54 @@ class MyBot(Bot):
         else:
             model_file = loaded_file
 
+        # Helper to extract state_dict if it's a ScriptModule (from C++ LibTorch)
+        if not isinstance(model_file, dict) and hasattr(model_file, "state_dict"):
+            print("Detected ScriptModule (likely from C++), extracting state_dict...")
+            model_file = model_file.state_dict()
+
         input_amount, action_amount, layer_sizes = model_info_from_dict(model_file)
+        print(f"Model detected: {input_amount} inputs, {action_amount} actions, layers {layer_sizes}")
 
         # Make the policy
         self.policy = DiscreteFF(input_amount, action_amount, layer_sizes, self.device)
-        self.policy.load_state_dict(model_file)
+        
+        # Load the state dict
+        # If the keys start with numbers (e.g. "0.weight"), it matches the internal sequential model
+        first_key = next(iter(model_file.keys()))
+        if first_key[0].isdigit():
+             print("Loading state dict into internal model sequence...")
+             self.policy.model.load_state_dict(model_file)
+        else:
+             print("Loading state dict into policy...")
+             self.policy.load_state_dict(model_file)
+
         torch.set_num_threads(1)
 
         #! update this with your action and obs
         action_parser = LookupTableAction()
-        Obs = DefaultObs(
-            zero_padding=3,
-            pos_coef=np.asarray([1 / common_values.SIDE_WALL_X, 
-                                 1 / common_values.BACK_NET_Y, 
-                                 1 / common_values.CEILING_Z]),
-            ang_coef=1 / np.pi,
-            lin_vel_coef=1 / common_values.CAR_MAX_SPEED,
-            ang_vel_coef=1 / common_values.CAR_MAX_ANG_VEL,
-            boost_coef=1 / 100.0
-        )
+        
+        # DYNAMICALLY CHOOSE OBS BUILDER BASED ON MODEL INPUTS
+        if input_amount == 89:
+            print("Using C++ compatible observation builder (89 features)")
+            Obs = CppDefaultObs(
+                pos_coef=np.array([1/common_values.SIDE_WALL_X, 1/common_values.BACK_NET_Y, 1/common_values.CEILING_Z]),
+                lin_vel_coef=1/common_values.CAR_MAX_SPEED,
+                ang_vel_coef=1/common_values.CAR_MAX_ANG_VEL,
+                boost_coef=1/100.0
+            )
+        else:
+            print(f"Using standard Python observation builder ({input_amount} features)")
+            # Fallback to standard DefaultObs with padding=3 (172 features)
+            Obs = DefaultObs(
+                zero_padding=3,
+                pos_coef=np.asarray([1 / common_values.SIDE_WALL_X, 
+                                     1 / common_values.BACK_NET_Y, 
+                                     1 / common_values.CEILING_Z]),
+                ang_coef=1 / np.pi,
+                lin_vel_coef=1 / common_values.CAR_MAX_SPEED,
+                ang_vel_coef=1 / common_values.CAR_MAX_ANG_VEL,
+                boost_coef=1 / 100.0
+            )
         
         # Setup Reward Function (Match train.py but use Tracking)
         self.reward_fn = TrackingCombinedReward(
@@ -159,6 +279,7 @@ class MyBot(Bot):
         self.prev_time = 0.0
         self.prev_control = ControllerState()
         self.controls = ControllerState()
+        self.prev_actions = np.zeros(8) # Track previous action array
         self.obs = Obs
         self.action_parser = action_parser
         self.sent_more_than_one_ball_warning = False
@@ -271,7 +392,9 @@ class MyBot(Bot):
             cars_ids = self.game_state.cars.keys()
 			
             # Build the obs with the ids
-            obs = self.obs.build_obs(cars_ids, self.game_state, shared_info={})
+            # PASS PREVIOUS ACTIONS
+            shared_info = {'prev_actions': {self.player_id: self.prev_actions}}
+            obs = self.obs.build_obs(cars_ids, self.game_state, shared_info=shared_info)
 
             # Get the obs of the current car
             obs = obs.get(self.player_id)
@@ -291,6 +414,8 @@ class MyBot(Bot):
             # Based on the action, parse it into an array of 8 values
             parsed_actions = self.action_parser.parse_actions(actions={self.player_id: action_idx}, state=self.game_state, shared_info={}).get(self.player_id)
             
+            # Store parsed actions for next frame obs
+            self.prev_actions = parsed_actions
 
             # Check for errors
             if len(parsed_actions.shape) == 2:
