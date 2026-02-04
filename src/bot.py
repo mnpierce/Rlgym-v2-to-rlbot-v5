@@ -206,7 +206,7 @@ class MyBot(Bot):
 
         # Get the bot data from model
         # Handle both full learner states and raw policy states
-        loaded_file = torch.load(model_path, map_location=self.device)
+        loaded_file = torch.load(model_path, map_location=self.device, weights_only=False)
         if isinstance(loaded_file, dict) and "policy_state_dict" in loaded_file:
             print("Detected full Learner state, extracting policy...")
             model_file = loaded_file["policy_state_dict"]
