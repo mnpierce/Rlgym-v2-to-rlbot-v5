@@ -19,7 +19,7 @@ from rlgym.rocket_league.reward_functions import CombinedReward
 
 # Your imports here
 from act import LookupTableAction
-from obs import DefaultObs
+from obs import DefaultObs, AdvancedObs
 from discrete import DiscreteFF
 
 from rlgym_compat.sim_extra_info import SimExtraInfo
@@ -79,7 +79,7 @@ def find_latest_checkpoint():
     script_dir = os.path.dirname(os.path.abspath(__file__))
     
     # 1. Look in the same folder as this script
-    checkpoints = glob.glob(os.path.join(script_dir, "**", "PPO_POLICY.*t"), recursive=True)
+    checkpoints = glob.glob(os.path.join(script_dir, "**", "*POLICY.*t"), recursive=True)
     
     return checkpoints[0]
 
@@ -97,11 +97,27 @@ def model_info_from_dict(loaded_dict):
         if ".bias" in key:
             bias_counts.append(value.size(0))
 
-    inputs = int(weight_counts[0] / bias_counts[0])
-    outputs = bias_counts[-1]
-    layer_sizes = bias_counts[:-1]
+    # Detect LayerNorm
+    # In GigaLearn, Linear is followed by LayerNorm. 
+    # Linear.bias size == LayerNorm.weight size == LayerNorm.bias size
+    is_layernorm = False
+    if len(weight_counts) > 1 and weight_counts[1] == bias_counts[0]:
+        print("Detected LayerNorm in model structure")
+        is_layernorm = True
 
-    return inputs, outputs, layer_sizes
+    if is_layernorm:
+        # Every pair of (Linear, LayerNorm) counts as one logical layer for our DiscreteFF
+        inputs = int(weight_counts[0] / bias_counts[0])
+        outputs = bias_counts[-1]
+        # bias_counts: [L1, LN1, L2, LN2, ..., Lout]
+        # We want [L1, L2, ...]
+        layer_sizes = bias_counts[:-1:2]
+    else:
+        inputs = int(weight_counts[0] / bias_counts[0])
+        outputs = bias_counts[-1]
+        layer_sizes = bias_counts[:-1]
+
+    return inputs, outputs, layer_sizes, is_layernorm
 
 
 # --- C++ Compatible Observation Builder ---
@@ -218,11 +234,11 @@ class MyBot(Bot):
             print("Detected ScriptModule (likely from C++), extracting state_dict...")
             model_file = model_file.state_dict()
 
-        input_amount, action_amount, layer_sizes = model_info_from_dict(model_file)
-        print(f"Model detected: {input_amount} inputs, {action_amount} actions, layers {layer_sizes}")
+        input_amount, action_amount, layer_sizes, is_layernorm = model_info_from_dict(model_file)
+        print(f"Model detected: {input_amount} inputs, {action_amount} actions, layers {layer_sizes}, LayerNorm={is_layernorm}")
 
         # Make the policy
-        self.policy = DiscreteFF(input_amount, action_amount, layer_sizes, self.device)
+        self.policy = DiscreteFF(input_amount, action_amount, layer_sizes, self.device, add_layer_norm=is_layernorm)
         
         # Load the state dict
         # If the keys start with numbers (e.g. "0.weight"), it matches the internal sequential model
@@ -240,7 +256,10 @@ class MyBot(Bot):
         action_parser = LookupTableAction()
         
         # DYNAMICALLY CHOOSE OBS BUILDER BASED ON MODEL INPUTS
-        if input_amount == 89:
+        if input_amount == 109:
+            print("Using GigaLearn compatible AdvancedObs builder (109 features)")
+            Obs = AdvancedObs()
+        elif input_amount == 89:
             print("Using C++ compatible observation builder (89 features)")
             Obs = CppDefaultObs(
                 pos_coef=np.array([1/common_values.SIDE_WALL_X, 1/common_values.BACK_NET_Y, 1/common_values.CEILING_Z]),

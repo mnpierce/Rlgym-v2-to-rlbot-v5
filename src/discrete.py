@@ -14,19 +14,22 @@ import numpy as np
 
 
 class DiscreteFF(nn.Module):
-    def __init__(self, input_shape, n_actions, layer_sizes, device):
+    def __init__(self, input_shape, n_actions, layer_sizes, device, add_layer_norm=False, activation=nn.ReLU):
         super().__init__()
         self.device = device
 
         assert len(layer_sizes) != 0, "AT LEAST ONE LAYER MUST BE SPECIFIED TO BUILD THE NEURAL NETWORK!"
-        layers = [nn.Linear(input_shape, layer_sizes[0]), nn.ReLU()]
-        prev_size = layer_sizes[0]
-        for size in layer_sizes[1:]:
+        
+        layers = []
+        prev_size = input_shape
+        for size in layer_sizes:
             layers.append(nn.Linear(prev_size, size))
-            layers.append(nn.ReLU())
+            if add_layer_norm:
+                layers.append(nn.LayerNorm(size))
+            layers.append(activation())
             prev_size = size
 
-        layers.append(nn.Linear(layer_sizes[-1], n_actions))
+        layers.append(nn.Linear(prev_size, n_actions))
         layers.append(nn.Softmax(dim=-1))
         self.model = nn.Sequential(*layers).to(self.device)
 

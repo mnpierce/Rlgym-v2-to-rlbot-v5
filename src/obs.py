@@ -133,3 +133,101 @@ class DefaultObs(ObsBuilder[AgentID, np.ndarray, GameState, Tuple[str, int]]):
              int(car.is_boosting),
              int(car.is_supersonic)]
         ])
+
+class AdvancedObs(ObsBuilder[AgentID, np.ndarray, GameState, Tuple[str, int]]):
+    """
+    Observation builder matching GigaLearn's AdvancedObs.
+    """
+    POS_COEF = 1 / 5000.0
+    VEL_COEF = 1 / 2300.0
+    ANG_VEL_COEF = 1 / 3.0
+
+    def __init__(self):
+        super().__init__()
+        self._state = None
+
+    def reset(self, agents: List[AgentID], initial_state: GameState, shared_info: Dict[str, Any]) -> None:
+        self._state = initial_state
+
+    def build_obs(self, agents: List[AgentID], state: GameState, shared_info: Dict[str, Any]) -> Dict[AgentID, np.ndarray]:
+        self._state = state
+        obs = {}
+        for agent in agents:
+            obs[agent] = self._build_obs(agent, state, shared_info)
+        return obs
+
+    def _build_obs(self, agent: AgentID, state: GameState, shared_info: Dict[str, Any]) -> np.ndarray:
+        car = state.cars[agent]
+        if car.team_num == ORANGE_TEAM:
+            inverted = True
+            ball = state.inverted_ball
+            pads = state.inverted_boost_pad_timers
+        else:
+            inverted = False
+            ball = state.ball
+            pads = state.boost_pad_timers
+
+        # 1. Ball (9)
+        obs = [
+            ball.position * self.POS_COEF,
+            ball.linear_velocity * self.VEL_COEF,
+            ball.angular_velocity * self.ANG_VEL_COEF
+        ]
+
+        # 2. Previous Action (8)
+        prev_action = shared_info.get('prev_actions', {}).get(agent, np.zeros(8))
+        obs.append(prev_action)
+
+        # 3. Boost Pads (34)
+        # GigaLearn logic: obs += 1.f if pads[i] else 1.f / (1.f + padTimers[i])
+        pads_obs = np.where(pads <= 0, 1.0, 1.0 / (1.0 + pads))
+        obs.append(pads_obs)
+
+        # 4. Self (29)
+        obs.append(self._add_player_to_obs(car, inverted, ball))
+
+        # 5. Others (Teammates + Opponents) (29 each)
+        teammates = []
+        opponents = []
+        for other_id, other_car in state.cars.items():
+            if other_id == agent:
+                continue
+            
+            player_obs = self._add_player_to_obs(other_car, inverted, ball)
+            if other_car.team_num == car.team_num:
+                teammates.append(player_obs)
+            else:
+                opponents.append(player_obs)
+        
+        obs.extend(teammates)
+        obs.extend(opponents)
+
+        return np.concatenate(obs)
+
+    def _add_player_to_obs(self, car: Car, inverted: bool, ball: PhysicsObject) -> np.ndarray:
+        phys = car.inverted_physics if inverted else car.physics
+        
+        # Rotation matrix [forward, right, up]
+        rot_mat = np.array([phys.forward, phys.right, phys.up]) # 3x3
+        
+        local_ang_vel = np.dot(rot_mat, phys.angular_velocity)
+        local_ball_pos = np.dot(rot_mat, ball.position - phys.position)
+        local_ball_vel = np.dot(rot_mat, ball.linear_velocity - phys.linear_velocity)
+
+        return np.concatenate([
+            phys.position * self.POS_COEF,
+            phys.forward,
+            phys.up,
+            phys.linear_velocity * self.VEL_COEF,
+            phys.angular_velocity * self.ANG_VEL_COEF,
+            local_ang_vel * self.ANG_VEL_COEF,
+            local_ball_pos * self.POS_COEF,
+            local_ball_vel * self.VEL_COEF,
+            [
+                car.boost_amount / 100.0,
+                float(car.on_ground),
+                float(car.has_flip),
+                float(car.is_demoed),
+                float(car.has_jumped)
+            ]
+        ])
