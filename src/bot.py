@@ -79,9 +79,12 @@ def find_latest_checkpoint():
     script_dir = os.path.dirname(os.path.abspath(__file__))
     
     # 1. Look in the same folder as this script
-    checkpoints = glob.glob(os.path.join(script_dir, "**", "*POLICY.*t"), recursive=True)
+    checkpoints = glob.glob(os.path.join(script_dir, "**", "POLICY.lt"), recursive=True)
+    if not checkpoints:
+         checkpoints = glob.glob(os.path.join(script_dir, "**", "*POLICY.*t"), recursive=True)
     
     return checkpoints[0]
+
 
 model_path = find_latest_checkpoint()
 
@@ -98,24 +101,31 @@ def model_info_from_dict(loaded_dict):
             bias_counts.append(value.size(0))
 
     # Detect LayerNorm
-    # In GigaLearn, Linear is followed by LayerNorm. 
-    # Linear.bias size == LayerNorm.weight size == LayerNorm.bias size
     is_layernorm = False
     if len(weight_counts) > 1 and weight_counts[1] == bias_counts[0]:
-        print("Detected LayerNorm in model structure")
         is_layernorm = True
 
     if is_layernorm:
-        # Every pair of (Linear, LayerNorm) counts as one logical layer for our DiscreteFF
-        inputs = int(weight_counts[0] / bias_counts[0])
-        outputs = bias_counts[-1]
-        # bias_counts: [L1, LN1, L2, LN2, ..., Lout]
-        # We want [L1, L2, ...]
-        layer_sizes = bias_counts[:-1:2]
+        # Every pair of (Linear, LayerNorm) counts as one logical layer
+        # If the number of bias tensors is odd, the last one is the output layer (no LN)
+        if len(bias_counts) % 2 == 1:
+            layer_sizes = bias_counts[:-1:2]
+            outputs = bias_counts[-1]
+        else:
+            # No separate output layer (typical for Shared Heads)
+            layer_sizes = bias_counts[::2]
+            outputs = bias_counts[-1]
     else:
-        inputs = int(weight_counts[0] / bias_counts[0])
-        outputs = bias_counts[-1]
-        layer_sizes = bias_counts[:-1]
+        # No LayerNorm. 
+        # Heuristic: If last layer is significantly smaller, it's probably the output layer
+        if len(bias_counts) > 1 and bias_counts[-1] < bias_counts[-2] and bias_counts[-1] < 100:
+            layer_sizes = bias_counts[:-1]
+            outputs = bias_counts[-1]
+        else:
+            layer_sizes = bias_counts
+            outputs = bias_counts[-1]
+
+    inputs = int(weight_counts[0] / bias_counts[0])
 
     return inputs, outputs, layer_sizes, is_layernorm
 
@@ -221,18 +231,45 @@ class MyBot(Bot):
         print(f"Loading model from: {model_path}")
 
         # Get the bot data from model
-        # Handle both full learner states and raw policy states
-        loaded_file = torch.load(model_path, map_location=self.device, weights_only=False)
-        if isinstance(loaded_file, dict) and "policy_state_dict" in loaded_file:
-            print("Detected full Learner state, extracting policy...")
-            model_file = loaded_file["policy_state_dict"]
-        else:
-            model_file = loaded_file
+        # GigaLearn separates Shared Head and Policy into two files
+        checkpoint_dir = os.path.dirname(model_path)
+        shared_path = os.path.join(checkpoint_dir, "SHARED_HEAD.lt")
+        policy_path = os.path.join(checkpoint_dir, "POLICY.lt")
 
-        # Helper to extract state_dict if it's a ScriptModule (from C++ LibTorch)
-        if not isinstance(model_file, dict) and hasattr(model_file, "state_dict"):
-            print("Detected ScriptModule (likely from C++), extracting state_dict...")
-            model_file = model_file.state_dict()
+        model_file = OrderedDict()
+        layer_offset = 0
+
+        if os.path.exists(shared_path):
+            print(f"Loading Shared Head from {shared_path}...")
+            shared_dict = torch.load(shared_path, map_location=self.device, weights_only=False)
+            if not isinstance(shared_dict, dict) and hasattr(shared_dict, "state_dict"):
+                 shared_dict = shared_dict.state_dict()
+            
+            # Dynamically determine the correct offset based on modules (including activation)
+            _, _, shared_layer_sizes, shared_is_ln = model_info_from_dict(shared_dict)
+            stride = 3 if shared_is_ln else 2
+            layer_offset = len(shared_layer_sizes) * stride
+            
+            for k, v in shared_dict.items():
+                model_file[k] = v
+            print(f"Shared head has {len(shared_layer_sizes)} layers, offset set to {layer_offset}")
+
+        print(f"Loading Policy from {policy_path}...")
+        policy_dict = torch.load(policy_path, map_location=self.device, weights_only=False)
+        if not isinstance(policy_dict, dict) and hasattr(policy_dict, "state_dict"):
+            policy_dict = policy_dict.state_dict()
+
+        # Handle full learner states
+        if "policy_state_dict" in policy_dict:
+            policy_dict = policy_dict["policy_state_dict"]
+
+        for k, v in policy_dict.items():
+            parts = k.split('.')
+            if parts[0].isdigit():
+                new_key = f"{int(parts[0]) + layer_offset}.{'.'.join(parts[1:])}"
+                model_file[new_key] = v
+            else:
+                model_file[k] = v
 
         input_amount, action_amount, layer_sizes, is_layernorm = model_info_from_dict(model_file)
         print(f"Model detected: {input_amount} inputs, {action_amount} actions, layers {layer_sizes}, LayerNorm={is_layernorm}")
