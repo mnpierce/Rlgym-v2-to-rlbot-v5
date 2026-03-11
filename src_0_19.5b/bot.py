@@ -4,6 +4,7 @@ import torch
 import sys
 import glob
 import math
+import datetime
 
 # Add root directory to path so we can import rewards.py
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
@@ -171,9 +172,27 @@ class CppDefaultObs(DefaultObs):
 class MyBot(Bot):
 
     def initialize(self):
+        # --- Match Log Setup ---
+        self.match_log_path = None
+        if self.index == 0:
+            try:
+                # Store logs in a shared 'logs' folder at the root of the project
+                logs_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "logs"))
+                if not os.path.exists(logs_dir):
+                    os.makedirs(logs_dir)
+                
+                # Create a unique filename for this specific match session
+                timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                self.match_log_path = os.path.join(logs_dir, f"match_log_{timestamp}.txt")
+                
+                with open(self.match_log_path, "w") as f:
+                    f.write(f"--- Match Started: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---\n")
+            except Exception as e:
+                print(f"Error initializing match log: {e}")
+        # -----------------------
+
         self.deterministic = True #NOTE: Set to True if you want to use deterministic actions, default is False
         self.tick_skip = 8 #NOTE: Set the amount of ticks to skip, default is 8
-        self.action_delay = 7 #NOTE: GigaLearn action delay
         self.ticks = self.tick_skip
         self.device = torch.device("cpu") #NOTE: Set the device to use, default is cpu
         
@@ -183,7 +202,7 @@ class MyBot(Bot):
         # GigaLearn separates Shared Head and Policy into two files
         checkpoint_dir = os.path.dirname(model_path)
         shared_path = os.path.join(checkpoint_dir, "SHARED_HEAD.lt")
-        policy_path = os.path.join(checkpoint_dir, "POLICY.lt")
+        policy_path = model_path
 
         model_file = OrderedDict()
         layer_offset = 0
@@ -272,7 +291,6 @@ class MyBot(Bot):
         self.prev_time = 0.0
         self.prev_control = ControllerState()
         self.controls = ControllerState()
-        self.current_action = np.zeros(8)
         self.next_action = np.zeros(8)
         self.obs = Obs
         self.action_parser = action_parser
@@ -288,6 +306,33 @@ class MyBot(Bot):
         """
         This function will be called by the framework many times per second. This is where the bot makes any decisions.
         """
+        # --- Score Logging ---
+        # Use frame_num / 120 to get actual match time (ignoring replays/pauses)
+        current_match_time = packet.match_info.frame_num / 120.0
+        if not hasattr(self, 'last_log_time'):
+            self.last_log_time = -60.0
+            
+        if current_match_time - self.last_log_time >= 60.0:
+            self.last_log_time = current_match_time
+            if self.match_log_path:
+                try:
+                    score_blue = packet.teams[0].score
+                    score_orange = packet.teams[1].score
+                    
+                    # Get names from players in the packet
+                    name_blue = "Blue"
+                    name_orange = "Orange"
+                    for i in range(len(packet.players)):
+                        p = packet.players[i]
+                        if p.team == 0: name_blue = p.name
+                        if p.team == 1: name_orange = p.name
+
+                    with open(self.match_log_path, "a") as f:
+                        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        f.write(f"[{now}] Match Time: {int(current_match_time // 60)}m {int(current_match_time % 60)}s | {name_blue}: {score_blue} - {name_orange}: {score_orange}\n")
+                except Exception as e:
+                    print(f"Error logging score: {e}")
+        # ---------------------
 
         # Calculate the time elapsed since the last frame
         cur_time = packet.match_info.frame_num
@@ -315,7 +360,10 @@ class MyBot(Bot):
         
         
         if self.ticks >= self.tick_skip:
-            self.ticks -= self.tick_skip
+            # We use modulo instead of -= so that if ticks spikes to 60 due to lag, 
+            # we drop the missed ticks and cleanly sync back to the 8-tick cadence,
+            # avoiding a PyTorch "catch-up" death loop.
+            self.ticks %= self.tick_skip
 
             # Get the car ids
             cars_ids = self.game_state.cars.keys()
@@ -343,19 +391,7 @@ class MyBot(Bot):
             # Based on the action, parse it into an array of 8 values
             parsed_actions = self.action_parser.parse_actions(actions={self.player_id: action_idx}, state=self.game_state, shared_info={}).get(self.player_id)
             
-            # --- DEBUG OUTPUT ---
-            # Print exactly what the bot is seeing and deciding every ~1 second (15 steps)
-            if self.index == 0:
-                if not hasattr(self, 'debug_step_count'):
-                    self.debug_step_count = 0
-                if self.debug_step_count % 15 == 0:
-                    pos = self.game_state.cars[self.player_id].physics.position
-                    print(f"[RLBot-Sync-Check] Step: {self.debug_step_count} | Pos: {pos[0]:.0f}, {pos[1]:.0f}, {pos[2]:.0f} | Chosen Action Array: {parsed_actions}")
-                self.debug_step_count += 1
-            # --------------------
-
-            # Store parsed actions for next frame obs
-            self.current_action = self.next_action
+            # Store parsed action
             self.next_action = parsed_actions
 
             # Check for errors
@@ -366,12 +402,8 @@ class MyBot(Bot):
             if len(self.next_action.shape) != 1:
                 raise Exception("Invalid action:", self.next_action)
 
-        if self.ticks < self.action_delay:
-            # We are in the delay period, use the action from the previous step
-            action_to_apply = self.current_action
-        else:
-            # Delay has passed, use the newly predicted action
-            action_to_apply = self.next_action
+        # No action delay — apply the latest action immediately
+        action_to_apply = self.next_action
 
         # Update the controls, but if not able to, just return the previous control
         try:
