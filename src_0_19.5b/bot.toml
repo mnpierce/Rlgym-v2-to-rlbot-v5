@@ -1,7 +1,7 @@
 #:schema https://rlbot.org/schemas/agent.json
 [settings]
 # The name that will be displayed in game
-name = "MattBotGGL-16b"
+name = "MattBotGGL-19b"
 # Path to loadout config from runner
 loadout_file = "loadout.toml"
 # (OPTIONAL) - what you want the working directory set to
@@ -17,7 +17,7 @@ run_command = "C:/Users/mnpie/OneDrive/Documents/GitHub/RocketLeagueBot/.venv/Sc
 run_command_linux = "C:/Users/mnpie/OneDrive/Documents/GitHub/RocketLeagueBot/.venv/Scripts/python.exe bot.py"
 # This must be a unqiue identifier for your bot
 # recommended format is "author/botname/version"
-agent_id = "Matt/MattBot/GGL-16b"
+agent_id = "Matt/MattBot/GGL-19b"
 
 # These values are optional but useful metadata for helper programs
 [details]
